@@ -1,0 +1,552 @@
+---
+title: "POLS 510 Final Project"
+author: "Trung-Anh Nguyen"
+date: "12/2/2020"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+rm(list=ls())
+knitr::opts_chunk$set(echo = TRUE, message = FALSE)
+library(tidyverse)
+library(dplyr)
+library(MASS)
+library(simcf)
+library(WhatIf)
+library(RColorBrewer)   # For nice colors
+library(pscl)
+library(car) # for influence statistics and outlier detection 
+library(ggstance)
+library(ggthemes)
+library(magrittr)
+library(stargazer)
+library(scales)
+source("http://faculty.washington.edu/cadolph/mle/avp.R")
+set.seed(1234567)
+options(scipen = 999)
+```
+
+
+```{r setup2, include=FALSE}
+## Get nice colors
+brewer <- brewer.pal(9, "Set1")
+purple <- brewer[4]  # Poisson on full data
+red <- brewer[1]     # Poisson on non-zeros
+blue <- brewer[2]    # Negative Binomial on non-zeros
+orange <- brewer[5]  # Zero-inflated Negative Binomial
+green <- brewer[3]   # Zero-inflated Poisson
+brown <- brewer[7]    # Quasipoisson
+nicegray <- "gray45"
+```
+
+```{r}
+## Load data
+df_1130 <- read.csv("df_1130.csv")
+df_1130 <- df_1130 %>% mutate(gdp_pc2 = gdp_pc*1000,
+                              pop_tot2 = pop_tot*1000000,
+                              gdp = gdp_pc2*pop_tot2,
+                              fdi_gdp = fdi/gdp)
+
+#test <- df_1130 %>% dplyr::select(country, cases_cum, gov_effect, vdem_libdem, pop_tot2, pop_density, gdp_pc2, air_travel)
+```
+
+
+```{r histogram}
+ggplot(df_1130, aes(x = cases_cum)) +
+  geom_histogram() +
+  scale_x_continuous(label = comma) +
+  labs(x = "Cumulative case counts") +
+  geom_rangeframe() +
+  theme_tufte()
+
+width <- 5
+ggsave("counts_histogram.png",
+       device = "png",
+       width=width, 
+       height=width/1.618)
+
+ggplot(df_1130, aes(x = log(cases_cum))) +
+  geom_histogram() +
+  scale_x_continuous(label = comma) +
+  labs(x = "Logged cumulative case counts") +
+  geom_rangeframe() +
+  theme_tufte()
+
+width <- 5 
+ggsave("logged_counts_histogram.png",
+       device = "png",
+       width=width, 
+       height=width/1.618)
+```
+
+# Model 1
+
+```{r}
+# Fit model using negative binomial regression (with controls)
+m1 <- cases_cum ~ gov_effect + vdem_libdem + gov_effect*vdem_libdem + log(pop_tot2) + log(pop_density) + log(gdp_pc2) + air_travel
+m1_df <- extractdata(m1, df_1130, na.rm = TRUE)
+
+nb.result1 <- glm.nb(formula=m1, data = m1_df)
+
+pe.nb1 <- nb.result1$coefficients
+vc.nb1 <- vcov(nb.result1)
+se.nb1 <- sqrt(diag(vc.nb1)) 
+ll.nb1 <- as.numeric(logLik(nb.result1))
+theta.nb1 <- nb.result1$theta
+alpha.nb1 <- 1/theta.nb1
+setheta.nb1 <- nb.result1$SE.theta
+print(alpha.nb1)
+
+summary(nb.result1)
+```
+
+
+```{r}
+## Set up counterfactuals (range over gov_effect, all else equal)
+gov_effectseq <- seq(-1.9, 2.3, 0.0425)
+xhyp <- cfMake(m1, m1_df, nscen = length(gov_effectseq))
+for (i in 1:length(gov_effectseq)) {
+  xhyp <- cfChange(xhyp, "gov_effect", x=gov_effectseq[i], scen=i)
+}
+
+# Simulate results 
+sims <- 1000
+simbetas.nb1 <- mvrnorm(sims, pe.nb1, vc.nb1) # draw parameters
+yhyp.nb1 <- loglinsimev(xhyp, simbetas.nb1)
+
+# Plot results with ggplot
+yhyp.tidy <- yhyp.nb1 %>%
+  bind_rows(
+    yhyp.nb1 %>% 
+      bind_rows() %>% 
+      mutate(goveffect=gov_effectseq,
+             model = "Model 1")
+  )
+
+ggplot(yhyp.tidy) +
+  aes(y = pe,
+      x = goveffect, 
+      ymax = upper, 
+      ymin = lower)+
+
+  # For point estimates
+  geom_line(color=blue, show.legend = FALSE) +
+  
+  # For confidence intervals
+  geom_ribbon(alpha = 0.2, linetype = 0, show.legend = FALSE) +
+  scale_y_continuous(label = comma,
+                     trans = "log10") +
+  labs(y = "Expected Counts of Covid-19 Cases", 
+       x = "Level of Government Effectiveness") +
+  theme_tufte()
+
+width <- 5 
+ggsave("counts_goveffect.png",
+       device = "png",
+       width=width, 
+       height=width/1.618)
+```
+
+
+```{r}
+# Counterfactuals for gov_effect at different democracy levels (-1sd, mean, +1sd)
+nscen <- length(gov_effectseq)
+abovemeanScen <- meanScen <- belowmeanScen <- cfMake(m1, m1_df, nscen)
+for (i in 1:nscen) {
+  # libdem Below Mean (loop over each gov_effect)
+  belowmeanScen <- cfChange(belowmeanScen, "gov_effect", x = gov_effectseq[i], scen = i)
+  belowmeanScen <- cfChange(belowmeanScen, "vdem_libdem", x = mean(m1_df$vdem_libdem) - sd(m1_df$vdem_libdem), scen = i)
+  # Above Mean (loop over each gov_effect)
+  abovemeanScen <- cfChange(abovemeanScen, "gov_effect", x = gov_effectseq[i], scen = i)
+  abovemeanScen <- cfChange(abovemeanScen, "vdem_libdem", x = mean(m1_df$vdem_libdem) + sd(m1_df$vdem_libdem), scen = i)
+  # Mean (loop over each gov_effect)
+  meanScen <- cfChange(meanScen, "gov_effect", x = gov_effectseq[i], scen = i)
+  meanScen <- cfChange(meanScen, "vdem_libdem", x = mean(m1_df$vdem_libdem), scen = i)
+}
+# Simulate expected probabilities for all scenarios
+belowmeanSims <- loglinsimev(belowmeanScen, simbetas.nb1, ci=0.95)
+meanSims <- loglinsimev(meanScen, simbetas.nb1, ci=0.95)
+abovemeanSims <- loglinsimev(abovemeanScen, simbetas.nb1, ci=0.95)
+
+# Plot with ggplot
+# Data wrangling
+belowmeanSims_tb <- belowmeanSims %>%
+  bind_rows() %>%
+  mutate(
+    xhyp = gov_effectseq,  # add "xhyp" as a covariate
+    libdem = "Less Lib.Democratic (-1sd)"  # add a column to identify which scenario
+  )
+meanSims_tb <- meanSims %>%
+  bind_rows() %>%
+  mutate(xhyp = gov_effectseq, libdem = "Average")
+abovemeanSims_tb <- abovemeanSims %>%
+  bind_rows() %>%
+  mutate(xhyp = gov_effectseq, libdem = "More Lib.Democratic (+1sd)")
+allSims_tb <- bind_rows(belowmeanSims_tb, meanSims_tb, abovemeanSims_tb)
+
+# Visualize EVs
+allSims_tb %>%
+  mutate(libdem = factor(libdem, levels = c("Less Lib.Democratic (-1sd)", "Average", "More Lib.Democratic (+1sd)"))) %>%
+  ggplot(aes(x = xhyp, y = pe, ymax = upper, ymin = lower, colour = libdem, fill = libdem)) +
+  geom_line() +
+  geom_ribbon(alpha = 0.2, linetype = 0) +
+  facet_wrap(~libdem) +
+  scale_y_continuous(trans = "log10",
+                     label = comma) +
+  labs(#title = "Predictions for countries at different liberal democracy levels",
+       y = "Expected counts of Covid-19 cases", x = "Government Effectiveness") +
+  theme_tufte() +
+  theme(legend.position = "none",
+        plot.title = element_text(size = 12,
+                                  hjust = 0.5))
+width <- 5.75 
+ggsave("predictions_democracy_levels.png",
+       device = "png",
+       width=width, 
+       height=width/1.618)
+```
+
+
+```{r}
+# Low vs High democratic first differences
+lowdemScen <- highdemScen <- cfMake(m1, m1_df, nscen = length(gov_effectseq))
+for (i in 1:length(gov_effectseq)) {
+  
+  # Low Dem Scen (loop over each age)
+  lowdemScen <- cfChange(lowdemScen, "gov_effect", x = gov_effectseq[i], xpre= gov_effectseq[i], scen = i)
+  lowdemScen <- cfChange(lowdemScen, "vdem_libdem", 
+                         x = mean(m1_df$gov_effect) - sd(m1_df$gov_effect), 
+                         xpre= mean(m1_df$gov_effect) + sd(m1_df$gov_effect), scen = i)
+
+  # High Dem (loop over each age)
+  highdemScen <- cfChange(highdemScen, "gov_effect", x = gov_effectseq[i], xpre= gov_effectseq[i], scen = i)
+  highdemScen <- cfChange(highdemScen, "vdem_libdem", x = mean(m1_df$gov_effect) + sd(m1_df$gov_effect), scen = i)
+}
+
+# Simulate first difference of cases with democracy level
+FD <- loglinsimfd(lowdemScen, simbetas.nb1, ci=0.95)
+
+#Plotting
+fd.plot <- FD %>%
+  bind_rows(
+    FD %>% 
+      bind_rows() %>% 
+      mutate(goveffect=gov_effectseq)
+  )
+
+ggplot(fd.plot) +
+  aes(y = pe,
+      x = goveffect, 
+      ymax = upper, 
+      ymin = lower) +
+  geom_line(color = "forestgreen") +
+  geom_ribbon(aes(ymin = lower, ymax = upper),
+              alpha = 0.5, linetype = 0, 
+              show.legend = FALSE, fill = "gray") +
+  scale_y_continuous(label = comma) +
+  theme_light() +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(#title = "First Differences",
+       #subtitle = "A less democratic (-1sd) compared to a more democratic (+1sd) country",
+       y = "Difference in Expected Counts of Cases", 
+       x = "Government Effectiveness") +
+  theme_tufte() +
+  theme(legend.position = "none",
+        plot.title = element_text(size = 10,
+                                  hjust = 0.5))
+width <- 5 
+ggsave("first_diff.png",
+       device = "png",
+       width=width, 
+       height=width/1.618)
+```
+
+Difference is not significant
+
+```{r}
+## Set up counterfactuals (range over vdem_libdem, all else equal)
+vdem_libdemseq <- seq(0, 1, 0.05)
+xhyp2 <- cfMake(m1, m1_df, nscen = length(vdem_libdemseq))
+for (i in 1:length(vdem_libdemseq))
+  xhyp2 <- cfChange(xhyp2, "vdem_libdem", x=vdem_libdemseq[i], scen=i)
+
+# Simulate results 
+yhyp.nb2 <- loglinsimev(xhyp2, simbetas.nb1)
+
+# Plot results with ggplot
+yhyp.tidy2 <- yhyp.nb2 %>%
+  bind_rows(
+    yhyp.nb2 %>% 
+      bind_rows() %>% 
+      mutate(vdem_libdem=vdem_libdemseq,
+             model = "Model 1")
+  )
+
+ggplot(yhyp.tidy2) +
+  aes(y = pe,
+      x = vdem_libdem, 
+      ymax = upper, 
+      ymin = lower)+
+
+  # For point estimates
+  geom_line(color=red, show.legend = FALSE) +
+  
+  # For confidence intervals
+  geom_ribbon(alpha = 0.2, linetype = 0, show.legend = FALSE) +
+  scale_y_continuous(trans = "log10",
+                     label = comma) +
+  labs(y = "Expected Counts of Covid-19 Cases", 
+       x = "Level of liberal democracy") +
+  theme_tufte() +
+  theme(legend.position = "none")
+
+width <- 5 
+ggsave("counts_libdem.png",
+       device = "png",
+       width=width, 
+       height=width/1.618)
+```
+
+```{r}
+quantile(m1_df$gdp_pc2)
+# Counterfactuals for gov_effect at different gdp_pc levels (-1sd, mean, +1sd)
+
+poorScen <- averageScen <- richScen <- cfMake(m1, m1_df, nscen)
+
+for (i in 1:nscen) {
+  # Poor (loop over each gov_effect)
+  poorScen <- cfChange(poorScen, "gov_effect", x = gov_effectseq[i], scen = i)
+  poorScen <- cfChange(poorScen, "gdp_pc2", x = mean(m1_df$gdp_pc2) - sd(m1_df$gdp_pc2), scen = i)
+  # Above Mean (loop over each gov_effect)
+  richScen <- cfChange(richScen, "gov_effect", x = gov_effectseq[i], scen = i)
+  richScen <- cfChange(richScen, "gdp_pc2", x = mean(m1_df$gdp_pc2) + sd(m1_df$gdp_pc2), scen = i)
+  # Mean (loop over each gov_effect)
+  averageScen <- cfChange(averageScen, "gov_effect", x = gov_effectseq[i], scen = i)
+  averageScen <- cfChange(averageScen, "gdp_pc2", x = mean(m1_df$gdp_pc2), scen = i)
+}
+# Simulate expected probabilities for all scenarios
+poorSims <- loglinsimev(poorScen, simbetas.nb1, ci=0.95)
+averageSims <- loglinsimev(averageScen, simbetas.nb1, ci=0.95)
+richSims <- loglinsimev(richScen, simbetas.nb1, ci=0.95)
+
+# Plot with ggplot
+# Data wrangling
+poorSims_tb <- poorSims %>%
+  bind_rows() %>%
+  mutate(
+    xhyp = gov_effectseq,  # add "xhyp" as a covariate
+    gdp_pc2 = "Poorer (-1sd)"  # add a column to identify which scenario
+  )
+averageSims_tb <- averageSims %>%
+  bind_rows() %>%
+  mutate(xhyp = gov_effectseq, gdp_pc2 = "Average")
+richSims_tb <- richSims %>%
+  bind_rows() %>%
+  mutate(xhyp = gov_effectseq, gdp_pc2 = "Richer (+1sd)")
+allSims_tb2 <- bind_rows(poorSims_tb, averageSims_tb, richSims_tb)
+
+# Visualize EVs
+allSims_tb2 %>%
+  mutate(gdp_pc2 = factor(gdp_pc2, levels = c("Poorer (-1sd)", "Average", "Richer (+1sd)"))) %>%
+  ggplot(aes(x = xhyp, y = pe, ymax = upper, ymin = lower, colour = gdp_pc2, fill = gdp_pc2)) +
+  geom_line() +
+  geom_ribbon(alpha = 0.2, linetype = 0) +
+  facet_wrap(~gdp_pc2) +
+  scale_y_continuous(trans = "log10",
+                     label = comma) +
+  labs(title = "Predictions for countries at different GDP per capita levels",
+       y = "Expected counts of Covid-19 cases (log scale)", x = "Government Effectiveness") +
+  theme_tufte() +
+  theme(legend.position = "none",
+        plot.title = element_text(size = 12,
+                                  hjust = 0.5))
+
+width <- 5 
+ggsave("prediction_gdp.png",
+       device = "png",
+       width=width, 
+       height=width/1.618)
+
+#Rich vs poor
+poorvrich <- cfMake(m1, m1_df, nscen)
+for (i in 1:nscen) {
+  poorvrich <- cfChange(poorvrich, "gov_effect", x = gov_effectseq[i], scen = i)
+  poorScen <- cfChange(poorvrich, "gdp_pc2", x = mean(m1_df$gdp_pc2) - sd(m1_df$gdp_pc2), scen = i)
+}
+# Simulate first difference of cases with democracy level
+FD2 <- loglinsimfd(poorvrich, simbetas.nb1, ci=0.95)
+
+#Plotting
+fd.plot2 <- FD2 %>%
+  bind_rows(
+    FD2 %>% 
+      bind_rows() %>% 
+      mutate(goveffect=gov_effectseq)
+  )
+
+ggplot(fd.plot2) +
+  aes(y = pe,
+      x = goveffect, 
+      ymax = upper, 
+      ymin = lower) +
+  geom_line(color = red) +
+  geom_ribbon(aes(ymin = lower, ymax = upper),
+              alpha = 0.5, linetype = 0, 
+              show.legend = FALSE,
+              fill = "gray") +
+  scale_y_continuous(label = comma) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(title = "Poorer (-1sd) compared to richer (+1sd) countries",
+       y = "Difference in Expected Counts of Covid-19 Cases", 
+       x = "Government Effectiveness") +
+  theme_tufte() +
+  theme(plot.title = element_text(size = 10,
+                                  hjust = 0.5))
+
+width <- 5 
+ggsave("first_diff_2.png",
+       device = "png",
+       width=width, 
+       height=width/1.618)
+```
+
+# Model 2
+
+```{r}
+# Model with infection variable
+# infection is a dummy var for recent exp w/ SARS, MERS, Ebola (1 means 100+ cases)
+#df_1130$infection <- as.factor(df_1130$infection)
+
+m2 <- cases_cum ~ gov_effect + vdem_libdem + gov_effect*vdem_libdem + infection + gov_effect*infection + log(pop_tot2) + log(pop_density) + log(gdp_pc2) + air_travel
+m2_df <- extractdata(m2, df_1130, na.rm = TRUE)
+
+nb.result2 <- glm.nb(formula=m2, data = m2_df)
+
+pe.nb2 <- nb.result2$coefficients
+vc.nb2 <- vcov(nb.result2)
+se.nb2 <- sqrt(diag(vc.nb2)) 
+ll.nb2 <- as.numeric(logLik(nb.result2))
+theta.nb2 <- nb.result2$theta
+setheta.nb2 <- nb.result2$SE.theta
+print(theta.nb2)
+
+summary(nb.result2)
+
+# Compare models
+stargazer(nb.result1, nb.result2,
+          dep.var.labels = "Cumulative COVID-19 cases",
+          covariate.labels = c("Government effectiveness",
+                               "Liberal democracy",
+                               "Dummy for Ebola/SARS/MERS exposure(1)",
+                               "ln(Total population)",
+                               "ln(Population density)",
+                               "ln(GDP per capita)",
+                               "ln(Air travel (passengers carried))",
+                               "Gov.effectiveness*Liberal democracy",
+                               "Gov.effectiveness*Ebola/SARS/MERS exposure"),
+          type="latex", omit="all")
+```
+
+```{r}
+## Set up counterfactuals (range over gov_effect, infection)
+infection0.scen <- infection1.scen <- cfMake(m2, m2_df, nscen = length(gov_effectseq))
+
+for (i in 1:length(gov_effectseq)) {
+  # For infection = 0
+  infection0.scen <- cfChange(infection0.scen, "gov_effect", x = gov_effectseq[i], xpre = gov_effectseq[i], scen = i)
+  infection0.scen <- cfChange(infection0.scen, "infection", x = 0, scen = i)
+  # For infection = 1
+  infection1.scen <- cfChange(infection1.scen, "gov_effect", x = gov_effectseq[i], xpre = gov_effectseq[i], scen = i)
+  infection1.scen <- cfChange(infection1.scen, "infection", x = 3, scen = i)
+}
+# Simulate expected probabilities for all scenarios
+simbetas.nb2 <- mvrnorm(sims, pe.nb2, vc.nb2) # draw parameters
+
+infection0.scen <- loglinsimev(infection0.scen, simbetas.nb2, ci=0.95)
+infection1.scen <- loglinsimev(infection1.scen, simbetas.nb2, ci=0.95)
+
+# Plot with ggplot
+# Data wrangling
+infection0 <- infection0.scen %>%
+  bind_rows() %>%
+  mutate(
+    xhyp = gov_effectseq,  # add "xhyp" as a covariate
+    infection = "No"  # add a column to identify which scenario
+  )
+infection1 <- infection1.scen %>%
+  bind_rows() %>%
+  mutate(xhyp = gov_effectseq, infection = "Yes")
+
+infection_tb <- bind_rows(infection0, infection1)
+
+# Visualize EVs
+infection_tb %>%
+  mutate(infection= factor(infection, levels = c("No", "Yes"))) %>%
+  ggplot(aes(x = xhyp, y = pe, ymax = upper, ymin = lower, color = infection, fill = infection)) +
+  geom_line() +
+  geom_ribbon(alpha = 0.2, linetype = 0) +
+  facet_wrap(~infection) +
+  scale_y_continuous(trans = "log10",
+                     label = comma) +
+  labs(title = "Predictions for countries with Ebola/SARS/MERS exposure",
+       subtitle = "(>100 cases)",
+       y = "Expected counts of Covid-19 cases", x = "Government Effectiveness") +
+  theme_tufte() +
+  theme(legend.position = "none",
+        plot.title = element_text(size = 12))
+
+width <- 5
+ggsave("prior_exposure_M2.png",
+       device = "png",
+       width=width, 
+       height=width/1.618)
+```
+
+
+# Goodness of Fit tests
+
+## Likelihood ratio test 
+```{r}
+#Check number of parameters in each model
+k.m1 <- length(pe.nb1) # Model 1
+k.m2 <- length(pe.nb2) # Model 2
+#Likelihood ratio test
+(lr.test <- 2*(ll.nb2 - ll.nb1))
+(lr.test.p <- pchisq(lr.test,df=(k.m2 - k.m1),lower.tail=FALSE)) #p-value for LR test
+```
+
+Difference not significant
+
+## AIC and BIC
+
+```{r}
+#AIC
+aic.m1 <- 2*k.m1 - 2*ll.nb1
+aic.m2 <- 2*k.m2 - 2*ll.nb2
+
+aic.test <- aic.m2 - aic.m1
+aic.test
+```
+
+If a model is more than 2 AIC units lower than another, then it is considered significantly better than that model -> not enough evidence
+
+```{r}
+x1 <- cbind(m1_df$gov_effect, m1_df$vdem_libdem, m1_df$pop_tot2, m1_df$pop_density, m1_df$gdp_pc2, m1_df$air_travel, m1_df$gov_effect*m1_df$vdem_libdem)
+x2 <- cbind(m2_df$gov_effect, m2_df$vdem_libdem, m2_df$pop_tot2, m2_df$pop_density, m2_df$gdp_pc2, m2_df$air_travel, m2_df$infection, m2_df$gov_effect*m2_df$vdem_libdem, m2_df$gov_effect*m2_df$infection)
+#BIC
+bic.m1 <- log(nrow(x1))*k.m1 - 2*ll.nb1
+bic.m2 <- log(nrow(x2))*k.m2 - 2*ll.nb2
+
+bic.test <- bic.m2 - bic.m1
+bic.test
+```
+
+The difference between the BIC for model 2 and the BIC for model 1 is `r round(bic.test, 2)`, and according to Raftery's suggested guidelines, it demostrates strong evidence for favoring model 2 over model 1.
+
+
+
